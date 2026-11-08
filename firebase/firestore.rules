@@ -1,0 +1,87 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function userPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function isStaff() {
+      return signedIn()
+        && exists(userPath())
+        && get(userPath()).data.role == 'staff';
+    }
+
+    function validCategory(value) {
+      return value in ['facilities', 'water', 'electricity', 'safety', 'sanitation', 'furniture'];
+    }
+
+    function validStatus(value) {
+      return value in ['submitted', 'in_progress', 'resolved'];
+    }
+
+    function validText(value, minLen, maxLen) {
+      return value is string && value.size() >= minLen && value.size() <= maxLen;
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isStaff();
+
+      // Self-registration can only ever create a student account.
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['name', 'email', 'role', 'department', 'campus', 'createdAt'])
+        && request.resource.data.role == 'student'
+        && request.resource.data.email == request.auth.token.email
+        && validText(request.resource.data.name, 2, 80);
+
+      // Users may edit their own details but never their role.
+      allow update: if isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'department', 'campus']);
+
+      allow delete: if false;
+    }
+
+    match /incidents/{incidentId} {
+      allow read: if signedIn();
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'title', 'description', 'category', 'status', 'location',
+          'reporterId', 'reporterName', 'imageUrl', 'imagePath',
+          'staffNote', 'createdAt', 'updatedAt', 'timeline'
+        ])
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == 'submitted'
+        && validCategory(request.resource.data.category)
+        && validText(request.resource.data.title, 5, 80)
+        && validText(request.resource.data.description, 15, 1000)
+        && validText(request.resource.data.location, 1, 120)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.timeline is list
+        && request.resource.data.timeline.size() == 1;
+
+      // Only staff can move a report through its lifecycle, and only the
+      // status-related fields may change. Each change must add one timeline entry.
+      allow update: if isStaff()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'updatedAt', 'timeline', 'staffNote'])
+        && validStatus(request.resource.data.status)
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.timeline.size() == resource.data.timeline.size() + 1;
+
+      // Students can withdraw their own report until staff start on it.
+      allow delete: if isStaff()
+        || (isOwner(resource.data.reporterId) && resource.data.status == 'submitted');
+    }
+  }
+}
